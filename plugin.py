@@ -12,6 +12,17 @@ import sublime
 import sublime_plugin
 import subprocess
 import threading
+import time
+import sys
+import re
+
+# Add plugin directory to path, so side-by-side modules succeeds
+if os.path.dirname(__file__) not in sys.path:
+    sys.path.insert(0, os.path.dirname(__file__))
+
+import cmakepresets
+import jsonschema
+
 from typing import Dict, List, Union, Optional, Any, Callable, Tuple
 
 
@@ -97,11 +108,11 @@ def parse_vcvarsall(vcvarsall_path: str,
             continue
         line = line.strip()
         key, value = line.split('=', 1)
-        key = key.lower()
-        if key in ("include", "lib", "libpath", "path"):
+        if key.lower() in ("include", "lib", "libpath", "path"):
             if value.endswith(os.pathsep):
                 value = value[:-1]
-            result[key] = value
+            # Cmake freaks out if path if not upper case
+            result[key.upper()] = value
     return result
 
 
@@ -157,7 +168,8 @@ def get_all_vs_installed_versions():
     cwd = join(os.environ["PROGRAMFILES(X86)"], "Microsoft Visual Studio",
                "Installer")
     cmd = "vswhere.exe -prerelease -legacy -format json -utf8"
-    data = json.loads(check_output(cmd, cwd=cwd))
+    res = check_output(cmd, cwd=cwd)
+    data = json.loads(res)
     return [{"path": vs["installationPath"],
              "version": vs["installationVersion"]} for vs in data]
 
@@ -183,11 +195,9 @@ def plugin_loaded() -> None:
     settings.add_on_change("CMakeBuilder", __reload_capabilities)
     __reload_capabilities()
 
-
 def plugin_unloaded() -> None:
     with __capabilities_cv:
         __capabilities = None
-
 
 def __reload_capabilities() -> None:
     sublime.set_timeout_async(__reload_capabilities_async)
@@ -287,7 +297,6 @@ def make_generator(build_folder: str, generator: Optional[str]) -> Generator:
         return UnixMakefilesGenerator()
     raise KeyError("unknown generator")
 
-
 def file_api(build_folder: str) -> str:
     return join(build_folder, ".cmake", "api", "v1")
 
@@ -327,15 +336,43 @@ def load_reply(build_folder: str) -> dict:
     with open(get_index_file(build_folder), "r") as fp:
         return json.load(fp)
 
-
-def get_cmake_generator(view: sublime.View, cmake: dict) -> Optional[str]:
+def  get_default_cmake_generator(view: sublime.View, cmake: dict) -> Optional[str]:
     key = "default_{}_generator".format(sublime.platform())
     default_gen = get_setting(view, key)
     if default_gen is None:
         if sublime.platform() == "windows":
             default_gen = get_default_vs_generator_name()
+    return default_gen
+
+
+def get_cmake_generator(view: sublime.View, cmake: dict) -> Optional[str]:
+    default_gen = get_default_cmake_generator(view, cmake)
     return get_cmake_value(cmake, 'generator', default_gen)
 
+def get_target_arch_from_architecture(platform: Optional[str]) -> Optional[str]:
+    if not platform:
+        return None
+    first = platform.split(",")[0]
+    if '=' in first:
+        return None
+    arch = first.strip().lower()
+
+    # NOTE: VS supports x64, ARM64 and Win32
+    if arch == "win32":
+        arch = "x86"
+    elif arch == "arm64":
+        arch = "arm"
+
+    return arch
+
+def get_host_arch_from_toolset(toolset: Optional[str]) -> Optional[str]:
+    if not toolset:
+        return None
+    for p in toolset.split(','):
+        k, _, v = p.partition('p')
+        if key.strip() == "host":
+            return value.strip()
+    return None
 
 def get_setting(view: Optional[sublime.View], key, default=None) -> Union[bool, str]:
     if view:
@@ -388,6 +425,24 @@ def get_cmake_env(window: sublime.Window) -> Dict[str, str]:
         pass
     return {}
 
+
+
+class CmakeBuildPresetCommand(ExecCommand):
+
+    def run(self,
+            working_dir: str,
+            build_dir: str,
+            preset: str,
+            env: 'Dict[str, str]',
+            generator: 'Optional[str]') -> None:
+        gen = make_generator(working_dir, generator)
+        build_dir = sublime.expand_variables(build_dir, self.window.extract_variables())
+        cmd = [get_cmake_binary(), "--build", build_dir, "--preset", preset]
+        super().run(cmd=cmd,
+                    working_dir=working_dir,
+                    env=env,
+                    syntax=gen.syntax(),
+                    file_regex=gen.regex())
 
 class CmakeBuildCommand(ExecCommand):
 
@@ -512,53 +567,111 @@ class CtestRunCommand(ExecCommand):
 
 class CmakeInfo:
 
-    __slots__ = ("unexpanded_build_folder", "build_folder", "overrides",
+    __slots__ = ("unexpanded_root_folder", "build_presets", "view", "host_arch", "target_arch", "unexpanded_build_folder", "build_folder", "overrides",
                  "generator", "platform", "toolset", "env", "vs_major_version",
-                 "working_dir", "__data", "window")
+                 "root_folder", "configure_presets", "presets", "preset", "has_presets", "presets_path", "__data", "window")
 
     def __init__(self, window: sublime.Window) -> None:
         self.window = window
+        default_build_folder = get_setting(window.active_view(), "default_build_folder",
+                              "$folder/build")
+        default_root_folder = get_setting(window.active_view(), "default_root_folder",
+                                          "$folder")
         try:
             data = window.project_data()
             if data is not None:
                 self.__data = data["settings"]["cmake"]
+                if "root_folder" not in self.__data:
+                    self.__data["root_folder"] = default_root_folder
+                if "build_folder" not in self.__data:
+                    self.__data["build_folder"] = default_build_folder
         except Exception:
-            default = get_setting(window.active_view(), "default_build_folder",
-                                  "$folder/build")
-            self.__data = {"build_folder": default}
+            self.__data = {
+                "build_folder": default_build_folder,
+                "root_folder": default_root_folder,
+            }
         self.unexpanded_build_folder = self.__get_val("build_folder")  # type: str
+        self.unexpanded_root_folder = self.__get_val("root_folder", "$folder") # type: str
+
         self.__data = expand(window, self.__data)
         self.build_folder = self.__get_val("build_folder")  # type: str
-        self.working_dir = self.__get_val("root_folder")  # type: str
-        if self.working_dir:
-            self.working_dir = realpath(self.working_dir)
-        else:
-            try:
-                self.working_dir = window.extract_variables()["folder"]
-            except KeyError:
-                self.working_dir = ""
-        if not isfile(join(self.working_dir, "CMakeLists.txt")):
+        self.root_folder = self.__get_val("root_folder")  # type: str
+        if self.root_folder:
+            self.root_folder = realpath(self.root_folder)
+        self.presets_path = join(self.root_folder, "CMakePresets.json")
+        self.has_presets = self.__has_presets()
+        if not isfile(join(self.root_folder, "CMakeLists.txt")):
             raise FileNotFoundError()
 
     def __get_val(self, key: str, default: 'Any' = None) -> 'Any':
         return get_cmake_value(self.__data, key, default)
 
-    def load(self) -> None:
+    def __on_select_preset(self, presets, callback):
+        # Default on select preset callback
+        # Shows the available presets and prompts for user input
+
+        preset_names = [["None", "Don't use a preset"]] + [[p.get("displayName", p["name"]), p.get("description", "")] for p in presets]
+
+        def on_selected(idx):
+            if idx >= 1:
+                callback(presets[idx - 1])
+            elif idx == 0:
+                callback(None)
+
+        self.window.show_quick_panel(preset_names, on_selected, placeholder = "Select a CMake preset")
+
+    def load(self, load_done_cb = None, select_preset_cb = None) -> None:
+        if not select_preset_cb:
+            select_preset_cb = self.__on_select_preset
         self.overrides = self.__get_val("command_line_overrides", {})  # type: Dict[str, str]
-        view = self.window.active_view()
-        if not view:
+        self.view = self.window.active_view()
+        if not self.view:
             raise RuntimeError("missing view")
-        self.generator = get_cmake_generator(view, self.__data)
+        self.generator = self.__get_val('generator')
         self.platform = self.__get_val("platform")  # type: Optional[str]
         self.toolset = self.__get_val("toolset")  # type: Dict[str, str]
+        self.host_arch = None # type: Optional[str]
+        self.target_arch = None # type: Optional[str]
         self.vs_major_version = self.__get_val("vs_major_version")  # type: int
         if not self.vs_major_version:
             versions = self.__get_val("visual_studio_versions", [])  # type: List[int]
             if versions:
                 self.vs_major_version = versions[0]
         self.env = self.__get_val("env", {})  # type: Dict[str, str]
+        
+        self.configure_presets = []
+        self.build_presets = []
+        self.presets = []
+        self.preset = None
+        self.__load_presets()
+        
+        if self.configure_presets and select_preset_cb:
+            select_preset_cb(self.configure_presets, lambda preset: self.__on_preset_selected(preset, load_done_cb))
+        else:
+            self.__on_preset_selected(load_done_cb=load_done_cb)
+
+    def __on_preset_selected(self, preset = None, load_done_cb = None):
+        self.preset = preset
+
+        if self.preset:
+            # NOTE: If generator not set explicitly in cmake settings, use generator
+            #       from preset or the default generator
+            if not self.generator:
+                self.generator = self.preset.get("generator", get_default_cmake_generator(self.view, self.__data))
+
         if sublime.platform() == "windows":
             self.__update_windows_environment(self.__data)
+
+        self.__load_build_presets()
+
+        if load_done_cb:
+            load_done_cb()
+
+    def get_configure_presets(self) -> 'List[Dict]':
+        return self.configure_presets
+
+    def get_build_presets(self) -> 'List[Dict]':
+        return self.build_presets 
 
     def to_command(self) -> 'List[str]':
         cmd = [get_cmake_binary(), ".", "-B", self.build_folder]
@@ -570,6 +683,8 @@ class CmakeInfo:
             cmd.append(self.__convert_toolset_to_str())
         if self.overrides:
             cmd.extend(self.__convert_overrides_to_list())
+        if self.preset:
+            cmd.extend(["--preset", self.preset["name"]])
         return cmd
 
     def __str__(self) -> str:
@@ -598,17 +713,46 @@ class CmakeInfo:
     def __update_windows_environment(self, data: 'Dict[str, Any]') -> None:
         if not self.generator:
             self.generator = get_default_vs_generator_name()
+
+        host_arch = None
+        if self.preset:
+            toolset = self.preset.get("toolset", None)
+            if isinstance(toolset, dict):
+                toolset = toolset.get("value", None)
+            host_arch = get_host_arch_from_toolset(toolset)
+
         if self.toolset:
-            host_arch = self.toolset.get("host", sublime.arch())
-        else:
-            host_arch = "x64"
-        target_arch = self.platform if self.platform else "x64"
+            arch = self.toolset.get("host", None)
+            if arch:
+                host_arch = arch
+        if not host_arch:
+            host_arch = sublime.arch()
+
+
+        target_arch = None
+        if self.preset:
+            architecture = self.preset.get("architecture")
+            if isinstance(architecture, dict):
+                architecture = architecture.get("value", None)
+            target_arch = get_target_arch_from_architecture(architecture)
+
+        if self.platform:
+            # TODO: In settings, platform should be dict instead of string, 
+            #       platform may include other options besides architecture,
+            #       such as SDK version to use 
+            target_arch = self.platform
         old_target_arch = get_cmake_value(data, "target_architecture")
         if old_target_arch:
+            # If old style target arch set in cmake settings, use that
             if old_target_arch == "amd64":
                 target_arch = "x64"
             else:
                 target_arch = old_target_arch
+
+        if not target_arch:
+            # NOTE: If target arch still not set, use x64
+            target_arch = "x64"
+
         host_arch = cmake_arch_to_vs_arch(host_arch)
         target_arch = cmake_arch_to_vs_arch(target_arch)
         if self.vs_major_version:
@@ -618,6 +762,84 @@ class CmakeInfo:
             env = get_vs_env_from_generator_str(self.generator, host_arch,
                                                 target_arch)
         self.env.update(env)
+
+    def __has_presets(self) -> bool:
+        return isfile(self.presets_path)
+
+    def __evaluate_condition(self, cond) -> bool:
+        if cond is True or cond is False:
+            return cond
+
+        if cond is None:
+            return True
+
+        cond_type = cond["type"]
+
+        if cond_type == "const":
+            return bool(cond["value"])
+
+        if cond_type in ("equals", "notEquals"):
+            lhs = cond["lhs"]
+            rhs = cond["rhs"]
+            res = lhs == rhs
+            return res if cond_type == "equals" else not res
+
+        if cond_type in ("inList", "notInList"):
+            string = cond["string"]
+            lst = cond["list"]
+            res = string in lst
+            return res if cond_type == "inList" else not res
+
+        if cond_type in ("matches", "ntoMatches"):
+            string = cond["string"]
+            regex = cond["regex"]
+            match = bool(re.search(regex, string))
+            return match if cond_type == "matches" else not match
+
+        if cond_type == "anyOf":
+            conds = cond["conditions"]
+            for cond in conds:
+                if __evaluate_condition(cond):
+                    return True
+            return False
+
+        if cond_type == "allOf":
+            conds = cond["conditions"]
+            for cond in conds:
+                if not __evaluate_condition(cond):
+                    return False
+            return True
+
+        if cond_type == "not":
+            cond = cond["condition"]
+            return not __evaluate_condition(cond)
+
+    def __load_presets(self) -> None:
+        if self.has_presets and not self.presets:
+            self.presets = cmakepresets.CMakePresets(self.presets_path)
+            self.__load_configure_presets()
+
+    def __load_build_presets(self) -> None:
+        if self.has_presets and self.preset:
+            # Get all build presets related to the selected configure preset
+            self.build_presets = self.presets.find_related_presets(self.preset["name"], "build")["build"]
+            # Flatten build presets
+            self.build_presets = [self.presets.resolve_macro_values("build", b["name"]) for b in self.build_presets]
+            # Filter out hidden presets
+            self.build_presets = [b for b in self.build_presets if not b.get("hidden", False)]
+            # Filter out disabled presets
+            self.build_presets = [b for b in self.build_presets if self.__evaluate_condition(b.get("condition", None))]
+
+    def __load_configure_presets(self) -> None:
+        # Flatten presets and resolve macros
+        self.configure_presets = [self.presets.resolve_macro_values("configure", p["name"]) for p in self.presets.configure_presets]
+        # Filter out hidden presets
+        self.configure_presets = [p for p in self.configure_presets if not p.get("hidden", False)]
+        # Filter out disabled presets
+        self.configure_presets = [p for p in self.configure_presets if self.__evaluate_condition(p.get("condition", None))]
+        # NOTE: We could hide presets with unsupported generator or when 
+        #       the respective visual studio major version is missing,
+        #       but that wouldn't match the default behaviour without presets
 
 
 class CmakeConfigureCommand(ExecCommand):
@@ -641,6 +863,23 @@ class CmakeConfigureCommand(ExecCommand):
     def description(self) -> str:
         return 'Configure'
 
+    def __on_load_done(self):
+        # Called, when cmake info is done loading
+
+        cmd = self.info.to_command()
+        if get_setting(self.window.active_view(),
+                       "silence_developer_warnings", False):
+            cmd.append("-Wno-dev")
+        write_query(self.window, self.info.build_folder)
+        self.window.status_message("Generating build system...")
+
+        super().run(
+            cmd=cmd,
+            working_dir=self.info.root_folder,
+            file_regex=r'CMake\s(?:Error|Warning)(?:\s\(dev\))?\sat\s(.+):(\d+)()\s?\(?(\w*)\)?:',
+            syntax=syntax("Configure"),
+            env=self.info.env)
+
     def run(self) -> None:
         if self.info is None:
             assert self.is_enabled()
@@ -663,19 +902,8 @@ class CmakeConfigureCommand(ExecCommand):
                        "always_clear_cache_before_configure", False):
             self.window.run_command("cmake_clear_cache",
                                     {"with_confirmation": False})
-        self.info.load()
-        cmd = self.info.to_command()
-        if get_setting(self.window.active_view(),
-                       "silence_developer_warnings", False):
-            cmd.append("-Wno-dev")
-        write_query(self.window, self.info.build_folder)
-        self.window.status_message("Generating build system...")
-        super().run(
-            cmd=cmd,
-            working_dir=self.info.working_dir,
-            file_regex=r'CMake\s(?:Error|Warning)(?:\s\(dev\))?\sat\s(.+):(\d+)()\s?\(?(\w*)\)?:',
-            syntax=syntax("Configure"),
-            env=self.info.env)
+
+        self.info.load(self.__on_load_done)
 
     def on_finished(self, proc):
         log("finished running cmake")
@@ -684,10 +912,27 @@ class CmakeConfigureCommand(ExecCommand):
         if exit_code == 0 or exit_code is None:
             self.window.status_message("Translating...")
             self.__parse_file_api()
+            self.__handle_build_presets()
             sublime.set_timeout(self.__write_project_data, 0)
         else:
             self.__erase_status()
             log("exited with an error")
+
+    def __handle_build_presets(self):
+        build_presets = self.info.get_build_presets()
+        for b in build_presets:
+            name = b["name"]
+            friendly_name = b.get("displayName", name)
+            build_system = {
+                "name": f"Preset - {friendly_name}",
+                "target": "cmake_build_preset",
+                "working_dir": self.info.unexpanded_root_folder,
+                "build_dir": self.info.unexpanded_build_folder,
+                "preset": b["name"],
+                "env": self.info.env,
+                "generator": self.info.generator
+            }
+            self.__build_systems.append(build_system)
 
     def __parse_file_api(self):
         if self.info is None:
@@ -940,16 +1185,19 @@ class Diag:
 
 
 class CmakeInsertDiagnosis:
+    # TODO: When using presets, and generator is set both in preset and cmake 
+    #       settings, issue a warning. If they are different, options from preset
+    #       might not be compatible.
 
     def __init__(self, view: sublime.View) -> None:
         self.view = view
 
-    def run(self):
+    def run(self, callback):
+        self.__callback = callback
         self.__table: List[Diag] = []
         if   not self.__check_cmake_binary():   pass
         elif not self.__check_cmake_version():  pass
         elif not self.__check_cmake_settings(): pass
-        return tabulate(self.__table)
 
     def __check_cmake_binary(self) -> bool:
         self.__table.append(Diag("cmake binary", get_cmake_binary(), ""))
@@ -981,45 +1229,51 @@ class CmakeInsertDiagnosis:
             return False
         return True
 
+    def __on_load_done(self):
+        self.__ok("build_folder", self.info.build_folder)
+        self.__ok("generator", self.info.generator)
+        if self.info.platform:
+            self.__ok("platform", self.info.platform)
+        if self.info.toolset:
+            self.__ok("toolset", self.info.toolset)
+        if self.info.vs_major_version:
+            self.__ok("selected vs major ver", self.info.vs_major_version)
+        self.__ok("command to be run", self.info)
+        self.__on_check_cmake_settings_complete(True)
+
+    def __on_check_cmake_settings_complete(self, ok: bool):
+        if not ok: pass
+        self.__callback(tabulate(self.__table))
+
     def __check_cmake_settings(self) -> bool:
         try:
-            window = self.view.window()
-            if window:
-                info = CmakeInfo(window)
-                info.load()
+            self.window = self.view.window()
+            if self.window:
+                self.info = CmakeInfo(self.window)
+                self.info.load(self.__on_load_done)
             else:
                 raise RuntimeError("failed to load window")
         except FileNotFoundError:
             self.__fail("CMakeLists.txt present",
                         "Make sure you have a CMakeLists.txt")
-            return False
-        self.__ok("build_folder", info.build_folder)
-        self.__ok("generator", info.generator)
-        if info.platform:
-            self.__ok("platform", info.platform)
-        if info.toolset:
-            self.__ok("toolset", info.toolset)
-        if info.vs_major_version:
-            self.__ok("selected vs major ver", info.vs_major_version)
-        self.__ok("command to be run", info)
-        return True
-
+            self.__on_check_cmake_settings_complete(False)
 
 class CmakeDiagnoseCommand(sublime_plugin.WindowCommand):
+
+    def __on_insert_diagnosis_complete(self, res):
+        self.window.new_html_sheet("CMakeBuilder Diagnosis",
+                                   res)
 
     def run(self):
         view = self.window.active_view()
         if not view:
             return
-        self.window.new_html_sheet(
-            "CMakeBuilder Diagnosis",
-            CmakeInsertDiagnosis(view).run()
-        )
+        CmakeInsertDiagnosis(view).run(self.__on_insert_diagnosis_complete)
+
 
     @classmethod
     def description(cls):
         return "Diagnose (Help! What should I do?)"
-
 
 def tabulate(data: List[Diag]) -> str:
     result: List[str] = []

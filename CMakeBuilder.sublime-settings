@@ -22,6 +22,10 @@
     // default. You can use variable substitutions.
     "default_build_folder": "$folder/build",
 
+    // When no root folder setting is present, use this root folder as a 
+    // default. You can use variale substitutions.
+    "default_root_folder": "$folder",
+
     // When no generator setting is present, use this generator as default.
     // For windows, `null` means the most recent Visual Studio version installed
     // on the system.
