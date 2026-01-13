@@ -5,6 +5,7 @@ from os import makedirs
 from os.path import isfile
 from os.path import join
 from os.path import realpath
+from pathlib import Path
 import json
 import os
 import shlex
@@ -395,6 +396,9 @@ def log(*args) -> None:
     if get_setting(None, "cmake_debug", False):
         print("CMakeBuilder:", *args)
 
+def warn(*args) -> None:
+    print("CMakeBuilder:", *args)
+
 
 def syntax(name: str) -> str:
     return "Packages/CMakeBuilder/Syntax/{}.sublime-syntax".format(name)
@@ -654,15 +658,43 @@ class CmakeInfo:
         self.preset = preset
 
         if self.preset:
+            self.__load_build_presets()
+
             # NOTE: If generator not set explicitly in cmake settings, use generator
             #       from preset or the default generator
             if not self.generator:
                 self.generator = self.preset.get("generator", get_default_cmake_generator(self.view, self.__data))
 
+            if self.build_presets:
+                print("a")
+                binary_dir = self.preset.get("binaryDir", None)
+                if binary_dir:
+                    # NOTE: We have build presets, and configure preset has a 
+                    #       binary dir set. We must use the configured binary dir,
+                    #       otherwise CMake will not find the build files when building
+                    #       with a build preset
+                    target = Path(binary_dir).resolve()
+                    base = Path(self.root_folder).resolve()
+
+                    binary_dir = str(target)
+                    try:
+                        build_folder = str(target.relative_to(base))
+                    except ValueError:
+                        pass
+
+                    self.build_folder = build_folder
+                    self.unexpanded_build_folder = build_folder
+
+                    try:
+                        buld_folder = get_cmake_value(self.window.project_data()["settings"]["cmake"], "build_folder", None)
+                        if build_folder:
+                            raise RuntimeError("Build folder specified in CMake settings, but CMake preset has build folder. using build folder from preset")
+                    except:
+                        pass
+
         if sublime.platform() == "windows":
             self.__update_windows_environment(self.__data)
 
-        self.__load_build_presets()
 
         if load_done_cb:
             load_done_cb()
