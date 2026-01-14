@@ -1,0 +1,7 @@
+- Logic for presets
+	- Allow overrides?
+	- Generate default build systems (ctest, run, build, ...) evnen when there are build presets?
+	- Error when build dir is specified in settings and cmake preset?
+- Remove build systems first (instead of commenting)
+	- Otherwise re-runs of configure bloats project file, especially when configuring multiple presets (with different binary dirs)
+- On windows, when generator is not visual studio XY, allow building without visual studio installed (possible extra setting for that)
