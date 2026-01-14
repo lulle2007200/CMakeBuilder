@@ -582,6 +582,7 @@ class CmakeInfo:
         default_root_folder = get_setting(window.active_view(), "default_root_folder",
                                           "$folder")
         try:
+            # Load settings from project
             data = window.project_data()
             if data is not None:
                 self.__data = data["settings"]["cmake"]
@@ -590,18 +591,23 @@ class CmakeInfo:
                 if "build_folder" not in self.__data:
                     self.__data["build_folder"] = default_build_folder
         except Exception:
+            # Use defaults
             self.__data = {
                 "build_folder": default_build_folder,
                 "root_folder": default_root_folder,
             }
+
         self.unexpanded_build_folder = self.__get_val("build_folder")  # type: str
         self.unexpanded_root_folder = self.__get_val("root_folder", "$folder") # type: str
 
         self.__data = expand(window, self.__data)
+
         self.build_folder = self.__get_val("build_folder")  # type: str
         self.root_folder = self.__get_val("root_folder")  # type: str
+
         if self.root_folder:
             self.root_folder = realpath(self.root_folder)
+
         self.presets_path = join(self.root_folder, "CMakePresets.json")
         self.has_presets = self.__has_presets()
         if not isfile(join(self.root_folder, "CMakeLists.txt")):
@@ -627,10 +633,13 @@ class CmakeInfo:
     def load(self, load_done_cb = None, select_preset_cb = None) -> None:
         if not select_preset_cb:
             select_preset_cb = self.__on_select_preset
+
         self.overrides = self.__get_val("command_line_overrides", {})  # type: Dict[str, str]
+
         self.view = self.window.active_view()
         if not self.view:
             raise RuntimeError("missing view")
+
         self.generator = self.__get_val('generator')
         self.platform = self.__get_val("platform")  # type: Optional[str]
         self.toolset = self.__get_val("toolset")  # type: Dict[str, str]
@@ -649,7 +658,7 @@ class CmakeInfo:
         self.preset = None
         self.__load_presets()
         
-        if self.configure_presets and select_preset_cb:
+        if self.configure_presets:
             select_preset_cb(self.configure_presets, lambda preset: self.__on_preset_selected(preset, load_done_cb))
         else:
             self.__on_preset_selected(load_done_cb=load_done_cb)
@@ -666,7 +675,6 @@ class CmakeInfo:
                 self.generator = self.preset.get("generator", get_default_cmake_generator(self.view, self.__data))
 
             if self.build_presets:
-                print("a")
                 binary_dir = self.preset.get("binaryDir", None)
                 if binary_dir:
                     # NOTE: We have build presets, and configure preset has a 
@@ -680,13 +688,13 @@ class CmakeInfo:
                     try:
                         build_folder = str(target.relative_to(base))
                     except ValueError:
-                        pass
+                        build_folder = str(target)
 
                     self.build_folder = build_folder
                     self.unexpanded_build_folder = build_folder
 
                     try:
-                        buld_folder = get_cmake_value(self.window.project_data()["settings"]["cmake"], "build_folder", None)
+                        build_folder = get_cmake_value(self.window.project_data()["settings"]["cmake"], "build_folder", None)
                         if build_folder:
                             raise RuntimeError("Build folder specified in CMake settings, but CMake preset has build folder. using build folder from preset")
                     except:
@@ -694,7 +702,6 @@ class CmakeInfo:
 
         if sublime.platform() == "windows":
             self.__update_windows_environment(self.__data)
-
 
         if load_done_cb:
             load_done_cb()
