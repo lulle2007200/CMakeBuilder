@@ -1039,7 +1039,12 @@ class CmakeConfigureCommand(ExecCommand):
                 for target in targets:
                     data = self.__load_reply_json_file(target["jsonFile"])
                     self.__handle_target(variants, name, data)
+                directory = configuration.get("directories", [None])[0]
+                if directory.get("hasInstallRule", False):
+                    variants.append({"name": "install", "build_target": "install"})
+
                 variants.append({"name": "ctest", "target": "ctest_run"})
+
                 build_system["variants"] = variants
                 self.__build_systems.append(build_system)
         except Exception as ex:
