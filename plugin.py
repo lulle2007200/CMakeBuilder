@@ -70,10 +70,12 @@ def check_output(shell_cmd, env=None, cwd=None):
         shell=shell,
         cwd=cwd)
     outs, errs = proc.communicate()
-    errs = errs.decode("utf-8")
+
+    encoding = "utf-8"
+    errs = errs.decode(encoding)
     if errs:
         raise CheckOutputException(errs)
-    return outs.decode("utf-8")
+    return outs.decode(encoding)
 
 
 def get_vcvarsall_path(desired_vs_major_version: int) -> str:
@@ -102,7 +104,10 @@ def parse_vcvarsall(vcvarsall_path: str,
         arg = "{}_{}".format(host_architecture, target_architecture)
     env_cmd = '"{}" {}'.format(vcvarsall_path, arg)
     shell = os.environ["COMSPEC"]
-    out = check_output('{} /s /c "{}" & set'.format(shell, env_cmd))
+
+    cmd = '{} /s /c "{} & set"'.format(shell, env_cmd)
+    out = check_output(cmd)
+
     result = {}
     for line in out.split("\n"):
         if '=' not in line:
