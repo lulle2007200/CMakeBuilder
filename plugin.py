@@ -453,13 +453,15 @@ class CmakeBuildCommand(ExecCommand):
     def run(
         self,
         working_dir: str,
+        build_dir: str,
         config: str,
         env: 'Dict[str, str]',
         build_target: 'Optional[str]' = None,
         generator: 'Optional[str]' = None,
     ) -> None:
         gen = make_generator(working_dir, generator)
-        cmd = [get_cmake_binary(), "--build", ".", "--config", config]
+        build_dir = sublime.expand_variables(build_dir, self.window.extract_variables())
+        cmd = [get_cmake_binary(), "--build", build_dir, "--config", config]
         if build_target:
             cmd.extend(["--target", build_target])
         super().run(
@@ -654,7 +656,7 @@ class CmakeInfo:
         
         self.configure_presets = []
         self.build_presets = []
-        self.presets = []
+        self.presets = None # type: Optional[cmakepresets.CMakePresets]
         self.preset = None
         self.__load_presets()
         
@@ -674,31 +676,34 @@ class CmakeInfo:
             if not self.generator:
                 self.generator = self.preset.get("generator", get_default_cmake_generator(self.view, self.__data))
 
-            if self.build_presets:
-                binary_dir = self.preset.get("binaryDir", None)
-                if binary_dir:
-                    # NOTE: We have build presets, and configure preset has a 
-                    #       binary dir set. We must use the configured binary dir,
-                    #       otherwise CMake will not find the build files when building
-                    #       with a build preset
-                    target = Path(binary_dir).resolve()
-                    base = Path(self.root_folder).resolve()
+            # if self.build_presets:
 
-                    binary_dir = str(target)
-                    try:
-                        build_folder = str(target.relative_to(base))
-                    except ValueError:
-                        build_folder = str(target)
+            binary_dir = self.preset.get("binaryDir", None)
+            if binary_dir:
+                # NOTE: We have build presets, and configure preset has a 
+                #       binary dir set. We must use the configured binary dir,
+                #       otherwise CMake will not find the build files when building
+                #       with a build preset
+                target = Path(binary_dir).resolve()
+                base = Path(self.root_folder).resolve()
 
-                    self.build_folder = build_folder
-                    self.unexpanded_build_folder = build_folder
+                binary_dir = str((base/target).resolve().relative_to(base))
 
-                    try:
-                        build_folder = get_cmake_value(self.window.project_data()["settings"]["cmake"], "build_folder", None)
-                        if build_folder:
-                            raise RuntimeError("Build folder specified in CMake settings, but CMake preset has build folder. using build folder from preset")
-                    except:
-                        pass
+                # Check for explicitly defined build_folder in cmake settings
+                try:
+                    cmake_build_folder = get_cmake_value(self.window.project_data()["settings"]["cmake"], "build_folder", None)
+                except:
+                    cmake_build_folder = None
+
+                # If explicitly defined in cmake settings *and* configure preset *and* there are build presets, error
+                # NOTE: When using build presets, cmake always expects build files to be in the directory specified in the configure preset 
+                if cmake_build_folder and self.build_presets:
+                    # TODO: Raise error or just use preset build folder?
+                    raise RuntimeError("Build folder specified in CMake settings, but CMake preset has build folder which must be used")
+
+                if not cmake_build_folder:
+                    self.build_folder = binary_dir
+                    self.unexpanded_build_folder = binary_dir
 
         if sublime.platform() == "windows":
             self.__update_windows_environment(self.__data)
@@ -838,20 +843,22 @@ class CmakeInfo:
         if cond_type == "anyOf":
             conds = cond["conditions"]
             for cond in conds:
-                if __evaluate_condition(cond):
+                if self.__evaluate_condition(cond):
                     return True
             return False
 
         if cond_type == "allOf":
             conds = cond["conditions"]
             for cond in conds:
-                if not __evaluate_condition(cond):
+                if not self.__evaluate_condition(cond):
                     return False
             return True
 
         if cond_type == "not":
             cond = cond["condition"]
-            return not __evaluate_condition(cond)
+            return not self.__evaluate_condition(cond)
+
+        raise RuntimeError(f"Invalid cmake preset condition: {cond}")
 
     def __load_presets(self) -> None:
         if self.has_presets and not self.presets:
@@ -1017,7 +1024,8 @@ class CmakeConfigureCommand(ExecCommand):
                     "name": name,
                     "config": name,
                     "target": "cmake_build",
-                    "working_dir": self.info.unexpanded_build_folder,
+                    "working_dir": self.info.unexpanded_root_folder,
+                    "build_dir": self.info.unexpanded_build_folder,
                     "env": self.info.env}
                 if self.info.generator:
                     build_system["generator"] = self.info.generator
